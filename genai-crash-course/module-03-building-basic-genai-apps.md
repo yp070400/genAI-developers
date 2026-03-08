@@ -255,6 +255,209 @@ Strategy 3: Semantic Retrieval
 
 ---
 
+## 3.8 Context Engineering
+
+> "The central job of a GenAI application developer is not writing prompts — it's engineering context."
+
+If you internalize one mental model from this entire course, make it this: **every LLM call is determined entirely by what you put in the context window**. The model has no state, no memory, no awareness of your system beyond what you send in that single request.
+
+**Context engineering** is the discipline of deciding:
+- What information to include in the context
+- What to exclude (cost, noise)
+- How to order it (position matters)
+- How to compress it (when it doesn't fit)
+
+---
+
+### What Context Is Made Of
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    CONTEXT WINDOW (e.g. 128K)                    │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ SYSTEM PROMPT                                            │   │
+│  │ Role, rules, output format, persona                      │   │
+│  │ [STATIC — same for all requests]                         │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ RETRIEVED DOCUMENTS (RAG)                                │   │
+│  │ Relevant chunks from your knowledge base                 │   │
+│  │ [DYNAMIC — changes per query]                            │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ TOOL OUTPUTS                                             │   │
+│  │ Results from tool calls in the current session           │   │
+│  │ [DYNAMIC — accumulates during agent runs]                │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ CONVERSATION HISTORY                                     │   │
+│  │ Previous turns in the current session                    │   │
+│  │ [DYNAMIC — grows over time, needs trimming]              │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ AGENT MEMORY                                             │   │
+│  │ Relevant facts retrieved from long-term memory store     │   │
+│  │ [DYNAMIC — pulled from vector store per query]           │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ USER QUERY                                               │   │
+│  │ The current user input / task                            │   │
+│  │ [DYNAMIC — changes every request]                        │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  [RESPONSE GENERATED HERE — consumes the remaining budget]       │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### The Context Assembly Pipeline
+
+```mermaid
+flowchart TB
+    subgraph SOURCES ["Context Sources"]
+        S1[System Prompt\nConfig / DB]
+        S2[RAG Retrieval\nVector Search]
+        S3[Tool Outputs\nAPI Results]
+        S4[Chat History\nSession Store]
+        S5[Agent Memory\nVector Store]
+        S6[User Query\nCurrent Input]
+    end
+
+    subgraph ASSEMBLY ["Context Assembly"]
+        A1[Fetch all sources\nin parallel]
+        A2[Score & Rank\nby relevance]
+        A3[Compress\noverlength items]
+        A4[Budget Allocator\nfit within window]
+        A5[Order & Format\nassemble final prompt]
+    end
+
+    SOURCES --> A1
+    A1 --> A2
+    A2 --> A3
+    A3 --> A4
+    A4 --> A5
+    A5 --> LLM[LLM Call]
+```
+
+---
+
+### Context Prioritization
+
+Not all context is equally important. Prioritize what goes in the window:
+
+```
+PRIORITY ORDER (highest → lowest)
+─────────────────────────────────────────────────────────────────
+1. System prompt         [Always include — defines behavior]
+2. User's current query  [Always include — the actual task]
+3. Most relevant RAG chunks [High priority — grounds the answer]
+4. Recent conversation turns [Medium — immediate context]
+5. Tool outputs          [Include only relevant ones]
+6. Older conversation    [Low priority — trim first when full]
+7. Agent memory facts    [Include if directly relevant]
+─────────────────────────────────────────────────────────────────
+
+Rule: When you must trim, trim from the bottom of this list first.
+```
+
+---
+
+### Context Compression
+
+When context is too large to fit, compress it rather than truncate it:
+
+```
+COMPRESSION STRATEGIES
+─────────────────────────────────────────────────────────────────
+Strategy 1: Summarize old conversation turns
+  Before:  10 full messages (2,000 tokens)
+  After:   "User asked about auth issues, we resolved JWT expiry" (30 tokens)
+
+Strategy 2: Extract key facts from documents
+  Before:  Full retrieved document (3,000 tokens)
+  After:   Bullet-point summary of relevant facts (200 tokens)
+
+Strategy 3: Deduplicate retrieved chunks
+  Multiple chunks may contain the same fact
+  Merge overlapping content before including
+
+Strategy 4: Progressive context loading
+  Start with minimal context
+  Add more only if the LLM signals it needs it ("I need more info about X")
+─────────────────────────────────────────────────────────────────
+```
+
+---
+
+### The Position Problem
+
+**Where you put information in the context matters.** Research shows LLMs perform best on information at the start and end of the context — the "lost in the middle" effect.
+
+```
+CONTEXT POSITIONING STRATEGY
+
+┌────────────────────────────────────────────────────────────┐
+│  POSITION: START                HIGH ATTENTION             │
+│  Put: System prompt                                        │
+│  Put: Most critical instructions                           │
+├────────────────────────────────────────────────────────────┤
+│  POSITION: MIDDLE               LOWER ATTENTION            │
+│  Put: Background documents                                 │
+│  Put: Older conversation turns                             │
+│  Put: Supplementary context                                │
+├────────────────────────────────────────────────────────────┤
+│  POSITION: END                  HIGH ATTENTION             │
+│  Put: Most relevant RAG chunks                             │
+│  Put: User's current query (always last)                   │
+└────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Context Engineering in Practice
+
+```python
+class ContextAssembler:
+    """Assembles the optimal context for each LLM call."""
+
+    TOKEN_BUDGET = 100_000  # leave 28K for response
+
+    def assemble(self, query: str, session_id: str) -> list[Message]:
+        budget = self.TOKEN_BUDGET
+        messages = []
+
+        # 1. System prompt — always first, non-negotiable
+        system = self.get_system_prompt()
+        budget -= count_tokens(system)
+        messages.append({"role": "system", "content": system})
+
+        # 2. Retrieve and rank context
+        rag_chunks = self.retrieve_chunks(query, k=10)
+        reranked   = self.rerank(query, rag_chunks)[:3]  # top 3
+
+        # 3. Get conversation history
+        history    = self.get_history(session_id, max_turns=20)
+
+        # 4. Allocate remaining budget
+        rag_tokens  = count_tokens(reranked)
+        hist_tokens = count_tokens(history)
+
+        if rag_tokens + hist_tokens > budget * 0.8:
+            # Compress: summarize oldest history first
+            history = self.compress_history(history, target_tokens=budget * 0.3)
+
+        # 5. Add context, history, then query (query always last)
+        messages.append({"role": "user", "content": format_context(reranked)})
+        messages.extend(history)
+        messages.append({"role": "user", "content": query})
+
+        return messages
+```
+
+---
+
 ## Key Takeaways — Module 3
 
 - GenAI apps have distinct layers: prompt building, LLM gateway, response parsing
@@ -262,7 +465,9 @@ Strategy 3: Semantic Retrieval
 - Few-shot examples dramatically improve consistency for complex tasks
 - Structured output (JSON schema / function calling) makes LLM responses reliably parseable
 - LLMs are stateless — you manage conversation history by re-sending it every call
-- Plan for context window overflow from day one — choose a windowing strategy
+- **Context engineering is the core skill**: what you put in the window determines everything
+- Prioritize context by importance — trim low-value content first when the window fills
+- Position matters: put the most critical instructions at the start and end
 
 ---
 

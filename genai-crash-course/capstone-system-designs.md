@@ -123,6 +123,69 @@ FORMAT:
 
 ---
 
+### Failure Modes
+
+```
+FAILURE                         CAUSE                    MITIGATION
+──────────────────────────────────────────────────────────────────────────
+Wrong answer, confident         Relevant chunk not        Hybrid search + reranker
+                                retrieved                 Larger k, then rerank to 3
+
+Answer not in docs              Knowledge gap             Graceful fallback message
+                                                          Route to human support
+
+Stale answer                    Docs changed, not         Webhook-triggered re-index
+                                re-indexed                Track last_indexed per doc
+
+Slow response (>5s)             Large document set,       Async embedding, cache
+                                cold vector search        Pinecone ANN (approximate)
+
+Context window overflow         Too many large chunks     Enforce chunk size limit
+                                                          Cap at 3 chunks × 512 tokens
+```
+
+---
+
+### Scalability Considerations
+
+```
+SCALE THRESHOLD → ACTION
+──────────────────────────────────────────────────────────────────────────
+< 100K chunks          pgvector is sufficient, no migration needed
+100K–1M chunks         Add HNSW index in pgvector, enable approximate search
+> 1M chunks            Migrate to Pinecone or Qdrant for managed ANN
+
+< 100 users/day        Single app instance, no caching needed
+100–1K users/day       Add Redis response cache, deduplicate repeat queries
+> 1K users/day         Horizontal scaling of app tier, semantic cache layer
+
+Embedding latency      Batch embed during ingestion; cache query embeddings
+```
+
+---
+
+### Cost Considerations
+
+```
+PER-QUERY COST BREAKDOWN (approximate)
+──────────────────────────────────────────────────────────────────────────
+Embed query:        1 call × text-embedding-3-small = ~$0.00002
+Reranker:           10 chunks × Cohere rerank = ~$0.001
+LLM call:           ~2,500 input tokens + ~400 output = ~$0.014
+─────────────────────────────────────────────────────────────────
+Total per query:    ~$0.015
+
+At 1,000 queries/day:  ~$15/day = ~$450/month
+At 10,000 queries/day: ~$150/day = ~$4,500/month
+
+COST REDUCTION:
+  Cache top 20% of repeated queries → saves ~$90/month at 1K/day
+  Use Claude Haiku for simple lookup queries → ~5x cheaper
+  Filter by metadata before vector search → reduce k, improve cost
+```
+
+---
+
 ## Design 2 — AI Research Agent
 
 **The problem:** Analysts spend days researching topics, reading papers, and synthesizing information. You want an agent that can be given a research question, autonomously gather information from multiple sources, and produce a structured report.
@@ -274,6 +337,48 @@ class Source(BaseModel):
     url: str
     relevance: str                  # one sentence why this was used
     accessed_at: datetime
+```
+
+---
+
+### Failure Modes
+
+```
+FAILURE                         CAUSE                    MITIGATION
+──────────────────────────────────────────────────────────────────────────
+Infinite research loop          Critic never satisfied    Max 2 critic iterations
+                                                          Hard timeout (10 min)
+
+Contradicting sources           Different sources         Critic explicitly checks
+                                disagree                  for contradictions, flags them
+
+Hallucinated citations          LLM invents sources       All sources must be from
+                                                          actual tool call results only
+
+Worker times out                External API slow         Per-worker timeout (60s)
+                                                          Continue with available data
+
+Cost overrun                    Too many tool calls       Max 20 tool calls total
+                                                          Human checkpoint after plan
+```
+
+---
+
+### Scalability & Cost Considerations
+
+```
+COST PER RESEARCH TASK (estimate)
+──────────────────────────────────────────────────────────────────────────
+Planner LLM call:       ~1K tokens in + 500 out   = ~$0.01
+3 workers × 5 tools:    ~15 tool calls            = API costs vary
+Aggregator LLM call:    ~10K tokens in + 1K out   = ~$0.17
+Synthesizer LLM call:   ~15K tokens in + 3K out   = ~$0.29
+Critic LLM call:        ~18K tokens in + 500 out  = ~$0.16
+─────────────────────────────────────────────────────────────────
+Estimated total:        ~$0.63–$2.00 per research task
+
+This is NOT a per-second latency system — it's a task system.
+Design for: async execution, job queue, email/webhook delivery of results.
 ```
 
 ---
@@ -484,6 +589,286 @@ def format_results(sql: str, results: list[dict], user_query: str) -> Response:
             Provide a 2-3 sentence summary of what the data shows.
         """)
         return SummaryResponse(summary=summary, download_url=export_csv(results))
+```
+
+---
+
+### Failure Modes
+
+```
+FAILURE                         CAUSE                    MITIGATION
+──────────────────────────────────────────────────────────────────────────
+Generated SQL is wrong          LLM misunderstood schema  Show SQL to user before running
+                                                          "Here's the query I'll run: ..."
+
+Query times out                 Complex join / no index   statement_timeout = 30s
+                                                          Return partial results with warning
+
+Wrong table selected            Ambiguous table names     Better table descriptions in schema
+                                                          Disambiguation prompt
+
+PII in result set               Query touches PII table   Block PII table access entirely
+                                                          Row-level security in Postgres
+
+LLM generates non-SELECT        Adversarial input         Layer 2 AST validation blocks it
+                                                          Read-only DB user blocks it
+
+Schema drift                    Table renamed/added       Re-embed descriptions on migration
+                                                          Alert when schema changes
+```
+
+---
+
+### Scalability & Cost Considerations
+
+```
+COST PER QUERY (estimate)
+──────────────────────────────────────────────────────────────────────────
+Schema retrieval (embed):    ~$0.00002
+LLM SQL generation:          ~2K tokens in + 300 out    = ~$0.009
+Result summarization:        ~1K tokens in + 200 out    = ~$0.004 (optional)
+─────────────────────────────────────────────────────────────────
+Total per query:             ~$0.013
+
+At 500 queries/day: ~$6.50/day = ~$200/month
+
+SCALE CONSIDERATIONS:
+  Cache exact query → SQL mappings for repeat queries (huge savings)
+  Pre-compute popular reports and serve them directly
+  GPT-4o-mini works well for SQL generation at 10x lower cost
+  pgvector sufficient for schema embeddings (<1K table descriptions)
+```
+
+---
+
+## Design 4 — AI Code Review Assistant
+
+**The problem:** Engineering teams spend significant review cycles catching the same classes of issues — missing error handling, security vulnerabilities, performance anti-patterns. You want an automated first-pass review that fires on every PR, catches common issues, and leaves actionable comments.
+
+---
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph TRIGGER ["GitHub Integration"]
+        GH[GitHub PR Webhook\nPR opened / updated] --> ING[Code Ingestion\nFetch diff via GitHub API]
+    end
+
+    subgraph CONTEXT ["Context Assembly"]
+        ING --> DIFF[Parse Diff\nFile-by-file changes]
+        DIFF --> EMB[Code Embedder\ntext-embedding-3-small]
+        EMB --> VDB[(Codebase Vector DB\nExisting code context)]
+        VDB --> RET[Related Code Retriever\nFind similar patterns in repo]
+    end
+
+    subgraph ANALYSIS ["LLM Analysis Pipeline"]
+        DIFF --> PREP[Chunk Preparer\nGroup by file / function]
+        RET --> PREP
+        PREP --> PA[Pattern Analyzer\nGPT-4o, temp=0]
+        PA --> SEC[Security Checker\nSeparate focused prompt]
+        PA --> PERF[Performance Reviewer\nSeparate focused prompt]
+        PA --> STYLE[Style & Consistency\nSeparate focused prompt]
+    end
+
+    subgraph OUTPUT ["Comment Generation"]
+        SEC --> AGG[Comment Aggregator\nDeduplicate + rank]
+        PERF --> AGG
+        STYLE --> AGG
+        AGG --> FILTER[Severity Filter\nOnly High + Medium]
+        FILTER --> GH_COM[GitHub Comment Writer\nPost inline PR comments]
+        GH_COM --> PR[PR Comments Posted]
+    end
+
+    OBS[Langfuse Tracing] -.-> PA
+```
+
+---
+
+### Component Decisions
+
+| Component | Choice | Why |
+|-----------|--------|-----|
+| LLM | GPT-4o, temperature=0 | Code analysis requires precision, determinism |
+| Code embeddings | text-embedding-3-small | Good for code similarity; specialized models marginal improvement |
+| Codebase index | pgvector | Fits in existing infra; codebase rarely > 100K chunks |
+| Analysis strategy | Separate prompts per concern | Mixing security + style + performance in one prompt reduces quality |
+| Comment delivery | GitHub Checks API | Native PR integration, inline comments on diff lines |
+
+---
+
+### The Code Context Strategy
+
+**Problem:** A diff alone lacks context. The LLM doesn't know what `process_payment()` does when it sees it being called in the diff.
+
+**Solution:** Use RAG over the entire codebase to retrieve relevant existing code.
+
+```mermaid
+flowchart LR
+    A[Changed function\nin diff] --> B[Embed function\nsignature + body]
+    B --> C[(Codebase\nVector DB)]
+    C --> D[Retrieve:\n- Functions it calls\n- Similar patterns elsewhere\n- Related test files]
+    D --> E[Enriched context\nfor LLM review]
+```
+
+**What gets embedded:**
+
+```python
+# Each function becomes a searchable unit
+def embed_codebase(repo_path: str):
+    for file in walk_code_files(repo_path):
+        for function in extract_functions(file):
+            chunk = {
+                "id":       f"{file.path}:{function.name}",
+                "content":  function.full_text,
+                "metadata": {
+                    "file":       file.path,
+                    "language":   file.language,
+                    "function":   function.name,
+                    "imports":    function.imports,
+                    "calls":      function.called_functions,
+                    "last_commit": file.last_modified
+                }
+            }
+            embed_and_store(chunk)
+```
+
+---
+
+### Specialized Analysis Prompts
+
+Rather than one giant prompt, run three focused LLM calls in parallel:
+
+```python
+SECURITY_PROMPT = """
+You are a security engineer reviewing a code diff for vulnerabilities.
+Focus ONLY on security issues.
+
+Common issues to check:
+- SQL injection, XSS, command injection
+- Hardcoded secrets or API keys
+- Insecure deserialization
+- Missing authentication/authorization checks
+- Unsafe file operations
+- Dependency vulnerabilities
+
+For each issue found, provide:
+{
+  "file": "path/to/file.py",
+  "line": line_number,
+  "severity": "critical|high|medium",
+  "issue": "one sentence description",
+  "fix": "concrete fix suggestion",
+  "example": "corrected code snippet"
+}
+
+If no security issues: return empty array [].
+Do NOT comment on style or performance.
+
+Code diff:
+{diff}
+
+Related existing code for context:
+{context}
+"""
+
+PERFORMANCE_PROMPT = """
+You are a performance engineer reviewing a code diff.
+Focus ONLY on performance issues: N+1 queries, missing indexes hints,
+inefficient algorithms, unnecessary re-computation, blocking I/O.
+[...similar structure...]
+"""
+
+STYLE_PROMPT = """
+You are a senior engineer checking code consistency.
+Focus ONLY on style, naming, error handling gaps, missing tests.
+Compare against the existing patterns retrieved from the codebase.
+[...similar structure...]
+"""
+```
+
+---
+
+### Comment Posting Strategy
+
+Not every issue should become a PR comment. Filter and prioritize:
+
+```python
+def filter_and_post_comments(all_issues: list[Issue], pr: PullRequest):
+
+    # 1. Deduplicate — same issue flagged by multiple analyzers
+    deduplicated = deduplicate_by_location(all_issues)
+
+    # 2. Severity filter — don't noise-flood the PR
+    high_priority = [i for i in deduplicated
+                     if i.severity in ("critical", "high")]
+    medium_priority = [i for i in deduplicated if i.severity == "medium"]
+
+    # 3. Cap medium comments — max 5 to avoid review fatigue
+    to_post = high_priority + medium_priority[:5]
+
+    # 4. Post as inline review comments on the diff
+    review = pr.create_review()
+    for issue in to_post:
+        review.add_comment(
+            path=issue.file,
+            line=issue.line,
+            body=format_comment(issue)
+        )
+
+    # 5. Post summary comment
+    pr.post_comment(generate_summary(all_issues, to_post))
+    review.submit(event="COMMENT")  # not REQUEST_CHANGES — respect the human
+```
+
+---
+
+### Failure Modes
+
+```
+FAILURE                         CAUSE                    MITIGATION
+──────────────────────────────────────────────────────────────────────────
+False positives (wrong issues)  LLM misunderstands        Context retrieval + prompt tuning
+                                codebase patterns         Collect feedback, track FP rate
+
+Too many comments (noise)       Low severity threshold    Hard cap: max 10 comments per PR
+                                                          Severity filter: high only by default
+
+Misses critical issues          LLM blind spot            Don't replace human review
+                                                          Frame as "first pass" not "final"
+
+Slow review (>2 min)            Large diff, slow LLM      Parallel analyzers + streaming
+                                                          Timeout: skip files > 500 lines
+
+Webhook delivery failure        GitHub API issues         Retry queue with exponential backoff
+                                                          Idempotent: check if review exists
+
+Codebase index stale            New patterns introduced   Re-index on merge to main
+                                                          Incremental: only re-embed changed files
+```
+
+---
+
+### Scalability & Cost Considerations
+
+```
+COST PER PR REVIEW (estimate, medium-sized PR: ~300 lines changed)
+──────────────────────────────────────────────────────────────────────────
+Codebase retrieval (embed diff):    ~$0.00005
+Context retrieval (3 searches):     ~$0.00015
+Security analysis LLM call:         ~4K tokens in + 500 out   = ~$0.015
+Performance analysis LLM call:      ~4K tokens in + 300 out   = ~$0.013
+Style analysis LLM call:            ~4K tokens in + 400 out   = ~$0.014
+─────────────────────────────────────────────────────────────────
+Total per PR:                       ~$0.042
+
+At 50 PRs/day: ~$2.10/day = ~$63/month — very cost-effective
+
+SCALE NOTES:
+  Large PRs (1000+ lines): chunk into file-level reviews, run in parallel
+  Monorepo: only analyze files changed in the diff (not full repo)
+  Codebase embedding: ~$2–5 one-time cost for 100K-function codebase
+  Cache embedding of unchanged files across PRs
 ```
 
 ---

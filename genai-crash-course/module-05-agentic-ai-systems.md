@@ -327,6 +327,185 @@ AGENT SAFETY PATTERN
 
 ---
 
+## 5.10 Deterministic Workflows vs. Autonomous Agents
+
+This is the most important architectural decision in agentic systems. The spectrum runs from "fully autonomous LLM decides everything" to "deterministic workflow with LLM nodes for reasoning."
+
+**In production, the right answer is almost always closer to deterministic.**
+
+---
+
+### The Spectrum
+
+```
+FULLY AUTONOMOUS                               FULLY DETERMINISTIC
+──────────────────────────────────────────────────────────────────────
+LLM decides every step               Workflow engine decides every step
+LLM picks tools                      Code picks tools
+LLM determines order                 Code determines order
+LLM decides when done                Code determines completion
+Unpredictable paths                  Predictable paths
+Hard to test                         Easy to test
+Hard to debug                        Easy to debug
+Great for exploration                Great for production
+```
+
+---
+
+### Autonomous Agent Loop
+
+The pattern from 5.2 — the LLM is in full control:
+
+```mermaid
+flowchart TD
+    A[Task] --> B[LLM: What should I do?]
+    B --> C{Decision}
+    C -->|Tool A| D[Execute Tool A]
+    C -->|Tool B| E[Execute Tool B]
+    C -->|Done| F[Response]
+    D --> B
+    E --> B
+
+    style B fill:#4A90D9,color:#fff
+```
+
+**Characteristics:**
+```
+✓ Flexible — handles tasks you didn't anticipate
+✓ Good for research, exploration, open-ended tasks
+✗ Unpredictable — hard to know what it will do
+✗ Hard to test — every run can be different
+✗ Expensive — may take more steps than necessary
+✗ Risky in production — can go off-rails
+```
+
+---
+
+### Deterministic Workflow with LLM Nodes
+
+The LLM is used only for specific reasoning tasks within a controlled workflow. The workflow engine (not the LLM) controls the execution graph.
+
+```mermaid
+flowchart TD
+    A[Input] --> B[Step 1: Validate Input\nDeterministic code]
+    B --> C[Step 2: LLM Node\nExtract intent + entities]
+    C --> D{Router\nDeterministic logic}
+    D -->|billing| E[Step 3a: Query billing DB\nDeterministic code]
+    D -->|technical| F[Step 3b: Search docs RAG\nDeterministic code]
+    E --> G[Step 4: LLM Node\nGenerate response with data]
+    F --> G
+    G --> H[Step 5: Validate output\nDeterministic code]
+    H --> I[Response]
+
+    style C fill:#4A90D9,color:#fff
+    style G fill:#4A90D9,color:#fff
+```
+
+**Characteristics:**
+```
+✓ Predictable — you know exactly what will happen
+✓ Testable — unit test each step independently
+✓ Debuggable — logs show exactly where something failed
+✓ Cost-controlled — known number of LLM calls per workflow
+✗ Less flexible — only handles cases you designed for
+✗ More upfront design work
+```
+
+---
+
+### When to Use Each
+
+```
+USE AUTONOMOUS AGENTS WHEN:           USE DETERMINISTIC WORKFLOWS WHEN:
+────────────────────────────────      ────────────────────────────────────
+Research / exploration tasks          Customer-facing production features
+Open-ended questions                  Tasks with compliance requirements
+Prototyping / experimentation         Tasks that touch real systems
+Internal tools (lower risk)           Tasks with predictable structure
+Creative generation tasks             High-frequency, cost-sensitive tasks
+Tasks with many unknown paths         Tasks where you need audit trails
+```
+
+**The practical rule:**
+
+> Start with a deterministic workflow. Identify the specific steps that are too complex to hard-code. Use LLM nodes for only those steps. Promote to a more autonomous agent only if the deterministic approach genuinely can't handle the variety of inputs you need to support.
+
+---
+
+### Hybrid Architecture: Deterministic Orchestration + LLM Reasoning Nodes
+
+This is the dominant production pattern used by mature GenAI teams:
+
+```mermaid
+flowchart TB
+    subgraph ORCHESTRATOR ["Workflow Engine (Deterministic)"]
+        S1[Step 1\nInput validation] --> S2
+        S2[Step 2\nData fetching] --> S3
+        S3[Step 3\nLLM reasoning] --> S4
+        S4[Step 4\nOutput validation] --> S5
+        S5[Step 5\nNotification]
+    end
+
+    subgraph LLM_NODE ["LLM Reasoning Node (Step 3)"]
+        L1[Assembled context\nfrom steps 1+2] --> L2[LLM Call]
+        L2 --> L3[Structured output\nvalidated by schema]
+    end
+
+    S3 --- LLM_NODE
+
+    style S3 fill:#4A90D9,color:#fff
+    style L2 fill:#4A90D9,color:#fff
+```
+
+**Orchestration frameworks for deterministic workflows:**
+
+| Framework | Type | Best for |
+|-----------|------|----------|
+| **LangGraph** | Graph-based state machine | Complex conditional flows, built for LLM workflows |
+| **Temporal** | Durable workflow engine | Long-running workflows, failure recovery, retry logic |
+| **AWS Step Functions** | Managed workflow service | Cloud-native, multi-service coordination |
+| **Prefect / Airflow** | Data pipeline orchestration | Batch processing, scheduled workflows |
+
+**LangGraph** is the most relevant choice for GenAI-specific workflows — it was designed for stateful agent graphs with conditional edges, checkpointing, and human-in-the-loop support.
+
+```python
+# LangGraph: define a deterministic graph where LLM is one node
+from langgraph.graph import StateGraph
+
+def validate_input(state):
+    # Deterministic: check input format, sanitize
+    return {"validated": True, "query": sanitize(state["query"])}
+
+def retrieve_context(state):
+    # Deterministic: RAG retrieval
+    chunks = vector_db.search(state["query"])
+    return {"context": chunks}
+
+def llm_reasoning(state):
+    # LLM node: only reasoning, not control flow
+    response = llm.call(build_prompt(state["context"], state["query"]))
+    return {"response": response}
+
+def validate_output(state):
+    # Deterministic: check response for safety, format
+    return {"final": guardrails.check(state["response"])}
+
+# Build the graph — workflow controls the path, not the LLM
+graph = StateGraph(AgentState)
+graph.add_node("validate_input",   validate_input)
+graph.add_node("retrieve_context", retrieve_context)
+graph.add_node("llm_reasoning",    llm_reasoning)
+graph.add_node("validate_output",  validate_output)
+
+graph.add_edge("validate_input",   "retrieve_context")
+graph.add_edge("retrieve_context", "llm_reasoning")
+graph.add_edge("llm_reasoning",    "validate_output")
+```
+
+The key insight: **the LLM is a node in the graph, not the controller of the graph**.
+
+---
+
 ## Key Takeaways — Module 5
 
 - Agents combine LLM reasoning with tool execution in a loop
@@ -336,6 +515,8 @@ AGENT SAFETY PATTERN
 - Agent memory has multiple types: in-context, external (long-term), semantic (vector)
 - Always constrain agents: max iterations, tool scope, input validation, logging
 - Task decomposition enables agents to tackle complex multi-step problems
+- **In production, prefer deterministic workflows with LLM reasoning nodes over fully autonomous agents**
+- Use LangGraph, Temporal, or Step Functions to control the workflow; use the LLM for the reasoning steps within it
 
 ---
 
