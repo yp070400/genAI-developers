@@ -1,32 +1,43 @@
- mport streamlit as st
-import vertexai
-from vertexai.generative_models import GenerativeModel
+# Navigate to project folder
+cd generative-ai/gemini/sample-apps/gemini-streamlit-cloudrun
 
-# Initialize Vertex AI
-vertexai.init(project="qwiklabs-gcp-02-451c7a556661", location="us-central1")
+# Create and activate Python virtual environment
+python3 -m venv venv
+source venv/bin/activate
 
-# Load Gemini Model
-model = GenerativeModel("gemini-1.5-flash")
+# Install dependencies
+pip install -r requirements.txt
 
-st.title("AI Chef Recipe Generator")
+# Set environment variables
+export PROJECT_ID=$(gcloud config get-value project)
+export REGION=us-central1
+export AR_REPO=chef-repo
+export SERVICE_NAME=chef-streamlit-app
 
-wine = st.text_input("Enter your preferred wine:")
+# Enable required services
+gcloud services enable run.googleapis.com \
+artifactregistry.googleapis.com \
+cloudbuild.googleapis.com \
+aiplatform.googleapis.com
 
-if st.button("Generate Meal Recommendation"):
+# Create Artifact Registry repository
+gcloud artifacts repositories create $AR_REPO \
+--repository-format=docker \
+--location=$REGION \
+--description="Chef repository"
 
-    prompt = f"""
-    The customer's wine preference is {wine}.
+# Configure docker authentication
+gcloud auth configure-docker $REGION-docker.pkg.dev --quiet
 
-    Please provide meal recommendations.
-    For each recommendation include preparation instructions,
-    time to prepare and the recipe title at the beginning.
+# Build Docker image
+gcloud builds submit \
+--tag $REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/$SERVICE_NAME
 
-    Then include the wine pairing for each recommendation.
-
-    At the end provide the calories associated with the meal
-    and the nutritional facts.
-    """
-
-    response = model.generate_content(prompt)
-
-    st.write(response.text)
+# Deploy to Cloud Run
+gcloud run deploy $SERVICE_NAME \
+--image $REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/$SERVICE_NAME \
+--platform managed \
+--region $REGION \
+--allow-unauthenticated \
+--port 8080 \
+--set-env-vars PROJECT_ID=$PROJECT_ID,REGION=$REGION
