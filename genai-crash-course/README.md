@@ -95,3 +95,39 @@
 | **Production Systems** | OWASP LLM Top 10, FinOps for LLMs, eval pipelines |
 | **Security** | OWASP LLM Top 10, Llama Guard, Rebuff |
 | **Multimodal** | Vision + text models, image embeddings, Whisper for audio |
+
+
+
+
+mport streamlit as st
+import vertexai
+from vertexai.generative_models import GenerativeModel
+
+# Initialize Vertex AI
+vertexai.init(project="qwiklabs-gcp-02-451c7a556661", location="us-central1")
+
+# Load Gemini Model
+model = GenerativeModel("gemini-1.5-flash")
+
+st.title("AI Chef Recipe Generator")
+
+wine = st.text_input("Enter your preferred wine:")
+
+if st.button("Generate Meal Recommendation"):
+
+    prompt = f"""
+    The customer's wine preference is {wine}.
+
+    Please provide meal recommendations.
+    For each recommendation include preparation instructions,
+    time to prepare and the recipe title at the beginning.
+
+    Then include the wine pairing for each recommendation.
+
+    At the end provide the calories associated with the meal
+    and the nutritional facts.
+    """
+
+    response = model.generate_content(prompt)
+
+    st.write(response.text)
